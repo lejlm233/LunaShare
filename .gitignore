@@ -52,3 +52,7 @@ __pycache__/
 
 # 本机路径的一次性续传测试脚本（含用户名，不入库）
 /tools/_test_resume.py
+
+# ===== LunaShare 固定签名 keystore：纳入仓库（白名单例外，覆盖上面的 *.jks/*.keystore）=====
+# 私钥随仓库分发，保证不同设备编译签名一致；密码在 local.properties（不入库）。
+!app/keystore/lunashare-release.jks

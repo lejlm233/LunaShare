@@ -277,3 +277,25 @@ LunaShare/
 ## 开源许可
 
 本项目由 [AceDroidX/frp-Android](https://github.com/AceDroidX/frp-Android)（FrpcAndroid）改造而来，保留了其 frp 设计思路，并以 OpenFrp 公网隧道的形式重新集成了 frpc 穿透能力，同时扩展为 HTTP/WebDAV + FTP + SMB 多协议本地文件共享工具。
+
+## 构建签名（Signing）
+
+本项目完全开源、无任何商业计划，因此发布签名密钥信息公开如下，方便任何人 clone 后直接编译出**签名一致**的安装包（避免不同设备 / 机器编译出现签名不一致导致无法覆盖安装的情况）。
+
+- **Keystore 文件**：`app/keystore/lunashare-release.jks`（已纳入仓库，`.gitignore` 白名单例外）
+- **别名（keyAlias）**：`lunashare`
+- **Keystore 密码 / Key 密码**：`ad6061a7383916a03868ab57618960bffe1c`
+- **有效期**：10000 天（约 27 年）
+- **证书指纹（固定值，所有构建一致）**：
+  - **SHA1**：`2C:EB:2E:4F:9F:1B:C5:A9:4A:A2:1F:B8:46:8B:CA:59:B1:88:15:F1`
+  - **SHA256**：`2F:92:84:2E:08:52:68:74:E6:C2:72:7A:67:74:43:28:2A:AC:33:85:36:E6:32:06:E4:C3:4F:DB:8C:F5:D3:0A`
+
+`release` 与 `debug` 构建类型**共用同一签名**（`app/build.gradle.kts` 的 `signingConfigs.release`），无需任何额外配置，clone 后即可 `./gradlew assembleDebug` / `assembleRelease`。
+
+> 重新生成命令（仅维护者需要时执行，生成后请同步更新上面密码与指纹）：
+> ```bash
+> keytool -genkeypair -v \
+>   -keystore app/keystore/lunashare-release.jks \
+>   -alias lunashare -keyalg RSA -keysize 2048 -validity 10000 \
+>   -dname "CN=luxi2035, OU=LunaShare, O=LunaShare, L=Shanghai, ST=Shanghai, C=CN"
+> ```

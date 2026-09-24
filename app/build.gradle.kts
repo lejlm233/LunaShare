@@ -24,13 +24,29 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            // 固定签名：release 与 debug 共用，避免不同设备编译签名不一致。
+            // 本项目完全开源、无商业计划，密钥信息公开于 README.md。
+            storeFile = rootProject.file("app/keystore/lunashare-release.jks")
+            storePassword = "ad6061a7383916a03868ab57618960bffe1c"
+            keyAlias = "lunashare"
+            keyPassword = "ad6061a7383916a03868ab57618960bffe1c"
+        }
+    }
+
     buildTypes {
+        debug {
+            // 与 release 共用同一固定签名，避免不同设备编译签名不一致
+            signingConfig = signingConfigs.getByName("release")
+        }
         release {
             isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
