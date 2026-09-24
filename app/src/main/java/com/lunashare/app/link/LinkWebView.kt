@@ -155,11 +155,21 @@ object LinkWebViewRegistry {
      */
     private fun nightContext(base: Context, dark: Boolean): Context {
         return try {
-            val cfg = Configuration(base.resources.configuration)
-            cfg.uiMode = (cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
-                if (dark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO
             val themeRes = if (dark) R.style.Theme_LunaShare_Dark else R.style.Theme_LunaShare
-            ContextThemeWrapper(base.createConfigurationContext(cfg), themeRes)
+            if (base is Activity) {
+                // base 是 Activity：保留它的 window token——chromium 内部的 <select> 下拉
+                // 弹窗（PopupWindow/Dialog）用 WebView 的 context 创建，在部分 ROM
+                // （荣耀/华为魔改内核）上非 Activity context 会创建失败且被静默吞掉，
+                // 表现为「点下拉框没反应」。uiMode 覆盖在这条路上让位给 token：
+                // 主题仍由 ContextThemeWrapper 显式指定（isLightTheme 决定算法变暗），
+                // App 主题与系统日夜不一致时 prefers-color-scheme 可能跟系统走，可接受。
+                ContextThemeWrapper(base, themeRes)
+            } else {
+                val cfg = Configuration(base.resources.configuration)
+                cfg.uiMode = (cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                    if (dark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO
+                ContextThemeWrapper(base.createConfigurationContext(cfg), themeRes)
+            }
         } catch (_: Exception) {
             base
         }
@@ -249,9 +259,13 @@ object LinkWebViewRegistry {
     fun obtain(context: Context, url: String, allowInsecure: Boolean): Entry {
         entries[url]?.let { return it }
         val nonce = DshPageAdapter.newNonce()
-        // 用 applicationContext（跨 Activity 重建存活），但包一层 [nightContext] 把
-        // 生效主题的 uiMode + isLightTheme 烘进去 —— WebView 只认这个，不认 App 自己画的皮。
-        val wv = WebView(nightContext(context.applicationContext, darkMode))
+        // base 优先用当前 Activity（而非 applicationContext）：chromium 的 <select> 原生
+        // 下拉弹窗等内部 UI 需要带 window token 的 Activity context，applicationContext
+        // 会让弹窗创建失败（静默，页面表现为点下拉无反应）。WebView 实例本身仍常驻
+        // 本注册表、跨 Activity 重建存活（Activity 销毁只多留一个引用，不触发销毁）。
+        val base = currentActivity ?: context.applicationContext
+        // 再包一层 [nightContext] 把生效主题烘进去（isLightTheme/算法变暗 + token 保留）
+        val wv = WebView(nightContext(base, darkMode))
         configure(wv, url, allowInsecure, nonce)
         val entry = Entry(webView = wv, nonce = nonce)
         entries[url] = entry
@@ -297,7 +311,25 @@ object LinkWebViewRegistry {
                 handler: SslErrorHandler?,
                 error: SslError?,
             ) {
-                if (allowInsecure) handler?.proceed() else handler?.cancel()
+                if (handler == null) return
+                // 设置里开了「允许不安全证书」→ 一律放行（沿用旧行为）
+                if (allowInsecure) {
+                    handler.proceed()
+                    return
+                }
+                // 会话内用户已对该主机选择「继续访问」→ 直接放行（含子资源，避免反复弹窗）
+                val host = hostOf(error?.url)
+                if (host != null && sslProceedHosts.contains(host)) {
+                    handler.proceed()
+                    return
+                }
+                val activity = currentActivity
+                if (activity == null || activity.isFinishing || activity.isDestroyed) {
+                    // 无可用 Activity（后台/重建间隙）→ 安全兜底：取消加载
+                    handler.cancel()
+                    return
+                }
+                showInsecureCertPrompt(activity, handler, error, host)
             }
 
             override fun onPageFinished(view: WebView?, loadedUrl: String?) {
@@ -480,6 +512,74 @@ object LinkWebViewRegistry {
             }
         }
         return measured
+    }
+
+    // ── SSL 证书错误：浏览器式「不安全连接」确认弹窗 ─────────────────────────────
+    // 会话内用户已选择「继续访问」的主机（进程存活期间有效，跨 WebView 实例共享）
+    private val sslProceedHosts = mutableSetOf<String>()
+    /** 当前是否已有 SSL 确认弹窗（同一页面的重定向链可能连续触发多次回调） */
+    @Volatile private var sslDialogShowing = false
+
+    /** 从 URL 提取主机名；解析失败返回 null */
+    private fun hostOf(url: String?): String? = runCatching {
+        url?.let { android.net.Uri.parse(it).host }
+    }.getOrNull()
+
+    /** 把 SslError 的错误码翻成人类可读的原因说明 */
+    private fun sslReasonOf(error: SslError?): String = when (error?.primaryError) {
+        SslError.SSL_NOTYETVALID -> "证书尚未生效"
+        SslError.SSL_EXPIRED -> "证书已过期"
+        SslError.SSL_IDMISMATCH -> "证书与站点域名不匹配"
+        SslError.SSL_UNTRUSTED -> "证书由不受信任的机构颁发（自签名）"
+        SslError.SSL_DATE_INVALID -> "证书日期无效"
+        SslError.SSL_INVALID -> "证书无效"
+        else -> "证书校验失败"
+    }
+
+    /**
+     * 弹出浏览器风格的确认框：继续访问（并记住该主机）或返回（取消加载）。
+     *
+     * 必须保证 [SslErrorHandler.proceed]/[SslErrorHandler.cancel] 二者恰被调用一次：
+     *  - 按钮点击里先置 [settled] 再调用对应方法；
+     *  - 用户按返回键关掉对话框走 OnCancelListener → 兜底 cancel；
+     *  - OnDismissListener 只负责清「弹窗展示中」标志（proceed 后 dismiss 也会走，不能 cancel）。
+     * handler 允许在回调返回之后异步调用，弹窗挂起期间加载自然暂停。
+     */
+    private fun showInsecureCertPrompt(
+        activity: Activity,
+        handler: SslErrorHandler,
+        error: SslError?,
+        host: String?,
+    ) {
+        if (sslDialogShowing) {
+            // 已有一个确认框在等待用户决策，后续回调（子资源/重定向）一律先取消
+            handler.cancel()
+            return
+        }
+        sslDialogShowing = true
+        val site = host ?: hostOf(error?.url) ?: "未知站点"
+        var settled = false
+        val dialog = android.app.AlertDialog.Builder(activity)
+            .setTitle("不安全的连接")
+            .setMessage(
+                "「$site」的安全证书存在问题（${sslReasonOf(error)}）。\n\n" +
+                    "继续访问可能存在信息泄露风险，请确认这是你信任的站点。"
+            )
+            .setNegativeButton("返回") { _, _ ->
+                settled = true
+                handler.cancel()
+            }
+            .setPositiveButton("继续访问") { _, _ ->
+                settled = true
+                if (host != null) sslProceedHosts.add(host)
+                handler.proceed()
+            }
+            .setOnCancelListener {
+                // 用户按返回键 / 点外部关闭：必须取消加载，否则加载流程挂死
+                if (!settled) handler.cancel()
+            }
+            .show()
+        dialog.setOnDismissListener { sslDialogShowing = false }
     }
 
     /** 判断地址是否为 zcode 远程桌面/开发页面（与 LinkScreen.isZcode 保持一致） */
