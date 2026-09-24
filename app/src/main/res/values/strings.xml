@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LunaShare</string>
+    <string name="service_name">LunaShare 共享服务</string>
+    <string name="service_channel_name">LunaShare 服务</string>
+    <string name="service_channel_desc">文件共享运行状态</string>
+    <string name="notification_running">LunaShare 运行中</string>
+    <string name="notification_stopped">LunaShare 已停止</string>
+    <string name="tab_files">文件</string>
+    <string name="tab_services">服务</string>
+    <string name="start">启动</string>
+    <string name="stop">停止</string>
+    <string name="save_config">保存配置</string>
+    <string name="config_saved">配置已保存</string>
+    <string name="config_error">配置错误</string>
+    <string name="setting">设置</string>
+    <string name="auto_start">开机自启</string>
+    <string name="dark_mode">深色模式</string>
+</resources>

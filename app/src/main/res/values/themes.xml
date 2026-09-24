@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.LunaShare" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- 亮色标记。WebView 判定「宿主是亮还是暗」读的就是这个属性（见深色主题的说明）。 -->
+        <item name="android:isLightTheme">true</item>
+    </style>
+
+    <!-- 深色主题：**Link Tab 的 WebView 用这一份**（见 LinkWebViewRegistry.nightContext）。
+
+         为什么还要这份"静态深色风格"，而不是只靠 values-night：
+         App 的亮/暗是**用户设置项**（可强制亮或强制暗），可能与系统日夜不一致。
+         `values-night` 只在系统深色时生效，管不了「系统亮色 + 用户强制深色」。
+         这份静态风格由运行时按**生效主题**显式选中，覆盖那种不一致的场景。
+
+         ⚠️ 另一个坑（已复核）：`android:isLightTheme` 是 API 29 才有的属性，aapt2 会自动
+         给它加版本限定符。写进 values-night/ 时条目被编成 night-v29 变体后与默认配置的
+         v29 变体冲突，**整条丢失**（本仓库早期确实如此：`(night)` 只剩 3 个 item，
+         没有 isLightTheme）→ WebView 拿到默认值 true，把 App 判成亮色，页面无论系统多黑
+         都是亮的。正确写法是**显式建 values-night-v29/**（见该目录），实测产物里
+         `(night-v29)` 含 `0x01010590=false`，可用 `aapt2 dump resources app-debug.apk` 复核。 -->
+    <style name="Theme.LunaShare.Dark" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF1A1C19</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:isLightTheme">false</item>
+    </style>
+</resources>

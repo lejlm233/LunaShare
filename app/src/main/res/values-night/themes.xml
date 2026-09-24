@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 系统处于深色时的窗口底色（服务 API 26~28：那边根本没有 isLightTheme）。
+
+         ⚠️ 这里**不要**写 android:isLightTheme：它是 API 29 属性，aapt2 需要把它编成
+         night-v29 变体，而由本文件（不带版本限定符）产出的那个变体会被丢掉——条目整条消失，
+         `(night)` 只剩 3 个 item。API 29+ 的变体要**显式**写进 values-night-v29/。
+         （已复核：values-night-v29/ 产出的 `(night-v29)` 含 0x01010590=false。）
+         详见 values-night-v29/themes.xml 与 values/themes.xml 的注释。
+
+         本文件只负责系统窗口层（首帧底色、系统栏），Compose 的颜色不读这里。 -->
+    <style name="Theme.LunaShare" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF1A1C19</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

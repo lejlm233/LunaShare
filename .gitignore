@@ -1,0 +1,54 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+/app/build
+/app/release
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# No native binaries needed - pure Kotlin/Java application
+
+# Build caches / local tooling
+.kotlin/
+.zcode/
+
+# WorkBuddy project memory / local debugging artifacts (never commit)
+/.workbuddy/
+
+# Native binary backups (keep only the active .so)
+*.so.bak
+_frpc_backup/
+
+# Local TLS CA cert (debug/self-signed, not referenced by any build input)
+/ca.pem
+
+# mefrpc upstream prebuilt source dir — builds use the tracked
+# app/src/main/jniLibs/arm64-v8a/libmefrpc.so instead; this dir is only
+# needed if you re-generate libmefrpc.so from the upstream release.
+/mefrpc_android_arm64_0.67.0_20260302_f1907e56/
+
+# luna-send.py 明文配置（含连接口令，切勿提交）
+tools/lunarc
+# Python 字节码缓存
+__pycache__/
+
+# 本地构建/安装/推送兜底脚本（Bash shim 坏时用绝对路径绕开 shell，仅本机使用）
+/build_debug.py
+/install_debug.py
+/git_run.py
+/fix_mefrpc_launch.py
+
+# EasyTier Magisk 模块本地构建产物
+/et-magisk.zip
+
+# 本机路径的一次性续传测试脚本（含用户名，不入库）
+/tools/_test_resume.py

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 注意这个目录名的 -v29：不是多余，是**必需**的。
+
+         `android:isLightTheme` 是 API 29 才有的属性。写在 values-night/ 里时，aapt2 需要
+         把它编成 night-v29 变体，但由「不带版本限定符的 night 目录」产出的那个变体会被丢掉，
+         `(night)` 里只剩 3 个 item —— 于是 WebView 读 isLightTheme 时拿到默认值 true，
+         把 App 判成亮色，页面无论系统多黑都是亮色。
+
+         显式写成 values-night-v29/ 就稳了。**已复核**：`aapt2 dump resources app-debug.apk`
+         可见 (night-v29) 含 4 个 item，其中包括 `0x01010590=false`。
+         （改资源后请重新复核这条，它是"页面不跟系统深色"这类回归的根因。）
+
+         ⚠️ 这一份只覆盖「系统深色」；「系统亮色 + 用户强制深色」由运行时显式选中
+         Theme.LunaShare.Dark 覆盖，见 LinkWebViewRegistry.nightContext。 -->
+    <style name="Theme.LunaShare" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF1A1C19</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:isLightTheme">false</item>
+    </style>
+</resources>

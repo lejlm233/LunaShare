@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Tunnel icon: two arrows through a tunnel -->
+    <group
+        android:translateX="22"
+        android:translateY="22">
+        <!-- Circle background -->
+        <path
+            android:fillColor="#4CAF50"
+            android:pathData="M32,0C14.33,0 0,14.33 0,32s14.33,32 32,32 32,-14.33 32,-32S49.67,0 32,0z" />
+        <!-- Arrow left -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M20,28 L28,20 L28,25 L36,25 L36,31 L28,31 L28,36 Z" />
+        <!-- Arrow right -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M44,28 L36,20 L36,25 L28,25 L28,31 L36,31 L36,36 Z" />
+    </group>
+</vector>
