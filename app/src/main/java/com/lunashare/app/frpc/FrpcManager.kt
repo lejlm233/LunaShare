@@ -35,6 +35,18 @@ class FrpcManager(private val context: Context) {
 
         /** Directory inside app files/ where we write TOMLs and drop logs */
         private const val FRPC_SUBDIR = "frpc"
+
+        /**
+         * 进程扫描清理所有遗留 frpc 进程（不依赖内存 Map）。
+         * 供 VPN 被系统收回(onRevoke)时调用：组网下 frpc 本应已暂停，
+         * 此调用清掉任何残留，防止孤儿隧道继续占用端口/服务器注册。
+         */
+        fun killAllStaleProcesses(filesDir: File) {
+            val marker = File(filesDir, FRPC_SUBDIR).absolutePath
+            runCatching {
+                Runtime.getRuntime().exec(arrayOf("pkill", "-9", "-f", marker)).waitFor()
+            }.onFailure { Log.w("FrpcManager", "killAllStaleProcesses 失败(可忽略): ${it.message}") }
+        }
     }
 
     // ── Public state ──────────────────────────────────────────────
@@ -139,6 +151,9 @@ class FrpcManager(private val context: Context) {
         }
 
         val binary = File(binaryPath)
+        // 清理上次 app 被强杀遗留的、属于该 proxyId 的孤儿 frpc 进程，
+        // 避免重建隧道时端口/双隧道冲突（不依赖内存 Map，靠进程扫描）。
+        killStaleForProxy(proxyId)
         if (!binary.exists() || !binary.canExecute()) {
             val msg = "frpc 二进制文件不存在或无法执行: $binaryPath"
             Log.e(TAG, msg)
@@ -173,8 +188,18 @@ class FrpcManager(private val context: Context) {
             tokenFlag, userToken,
             "-p", proxyId.toString()
         )
-        // mefrpc 附加参数（--api-root-url <IP> --skip-cert-verify）：DNS 走 IP 绕过 8.8.8.8 拦截
-        val cmd = baseCmd + extraArgs.toTypedArray()
+        // mefrpc 走本地反向代理（系统 DNS 解析 api.mefrp.com，绕过其内置 8.8.8.8 被墙）：
+        // Go net/http 默认 client 不读 HTTPS_PROXY 环境变量，故用 --api-root-url 显式指向
+        // 127.0.0.1 本地代理（mefrpc 连 127.0.0.1 是 IP，无需 DNS 解析）。
+        val apiRootArgs = if (tokenFlag == "-t") {
+            val proxyPort = MefrpProxyGateway.ensureStarted(context)
+            val apiRoot = "http://127.0.0.1:$proxyPort"
+            Log.i(TAG, "mefrp 注入 --api-root-url=$apiRoot（本地反向代理，系统 DNS 解析 api.mefrp.com）")
+            listOf("--api-root-url", apiRoot)
+        } else {
+            emptyList()
+        }
+        val cmd = baseCmd + extraArgs.toTypedArray() + apiRootArgs.toTypedArray()
 
         appendLog(proxyId, "正在启动 frpc 进程...")
         appendLog(proxyId, "命令: ${cmd.joinToString(" ")}")
@@ -185,21 +210,11 @@ class FrpcManager(private val context: Context) {
                 .redirectErrorStream(true)
 
             val env = pb.environment()
-            if (tokenFlag == "-t") {
-                // mefrp: 经本地 CONNECT 代理用系统 DNS 解析，绕过 8.8.8.8 拦截。
-                // mefrpc 是纯 Go 静态二进制，尊重 HTTPS_PROXY 环境变量
-                // （net/http.ProxyFromEnvironment），但默认进程环境被清过，这里显式注入。
-                val proxyPort = MefrpProxyGateway.ensureStarted(context)
-                val proxyUrl = "http://127.0.0.1:$proxyPort"
-                env["HTTPS_PROXY"] = proxyUrl
-                env["HTTP_PROXY"] = proxyUrl
-                env["NO_PROXY"] = "localhost,127.0.0.1"
-                Log.i(TAG, "mefrp 注入 HTTPS_PROXY=$proxyUrl（本地代理，系统 DNS 解析 api.mefrp.com）")
-            } else {
-                // Ensure no proxy env leaks break OpenFrp connections
-                env.remove("HTTP_PROXY")
-                env.remove("HTTPS_PROXY")
-            }
+            // mefrpc 已通过 --api-root-url 指向本地反向代理，不再注入 env 代理
+            // （Go net/http 默认 client 不读 HTTPS_PROXY，注入无效）。OpenFrp 直连，
+            // 这里清掉可能残留的代理变量避免干扰。
+            env.remove("HTTP_PROXY")
+            env.remove("HTTPS_PROXY")
             // Go static binaries don't read Android's CA store; point them at
             // our bundled copy so OpenFrp API TLS verification succeeds.
             prepareCaBundle()?.let { caPath ->
@@ -247,6 +262,32 @@ class FrpcManager(private val context: Context) {
             appendLog(proxyId, "ERROR: 启动失败 — ${e.message}")
             false
         }
+    }
+
+    /**
+     * 进程扫描清理：杀掉命令行中匹配 `-p <proxyId>` 的遗留 frpc 进程。
+     * 用于 app 被 force-stop 后残留的孤儿 frpc——内存 Map 已随进程消失，
+     * 只有扫描 /proc 才能找到并回收，防止重建隧道时端口冲突/双隧道。
+     * 精确匹配 proxyId（后接非数字或行尾），避免 `-p 123` 误杀 `-p 12345`。
+     */
+    private fun killStaleForProxy(proxyId: Int) {
+        val marker = File(context.filesDir, FRPC_SUBDIR).absolutePath
+        runCatching {
+            val pgrep = Runtime.getRuntime().exec(arrayOf("pgrep", "-f", marker))
+            val pids = pgrep.inputStream.bufferedReader().readLines()
+                .mapNotNull { it.toIntOrNull() }
+            pgrep.waitFor()
+            val re = Regex("-p[ =]$proxyId(\\D|$)")
+            for (pid in pids) {
+                val cmdline = runCatching {
+                    File("/proc/$pid/cmdline").readText().replace('\u0000', ' ')
+                }.getOrNull() ?: continue
+                if (re.containsMatchIn(cmdline)) {
+                    Runtime.getRuntime().exec(arrayOf("kill", "-9", pid.toString())).waitFor()
+                    Log.i(TAG, "killStaleForProxy: 回收 proxyId=$proxyId 的孤儿 frpc (pid=$pid)")
+                }
+            }
+        }.onFailure { Log.w(TAG, "killStaleForProxy 失败(可忽略): ${it.message}") }
     }
 
     /** Stop a single tunnel's frpc process. */

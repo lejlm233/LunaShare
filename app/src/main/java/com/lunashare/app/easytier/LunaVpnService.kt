@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.easytier.jni.EasyTierJNI
+import com.lunashare.app.frpc.FrpcManager
 import com.lunashare.app.service.FgNotificationHelper
 import kotlin.concurrent.thread
 
@@ -86,7 +87,11 @@ class LunaVpnService : VpnService() {
             .setSession("LunaShare EasyTier")
             .setMtu(1300) // 与官方 GUI 一致，穿透隧道下更稳
             .addAddress(ip, prefix)
-            .addDisallowedApplication("com.lunashare.app") // 防止组网流量自环
+            // 注意：不再对本应用 addDisallowedApplication。
+            // 否则 FileServer(HTTP) 的回包会被豁免、绕过 VPN 隧道，导致对端经虚拟 IP
+            // 发起的 TCP 握手永远收不到 SYN-ACK（现象：ping 通但 http://虚拟IP:端口 连不上）。
+            // EasyTier 核心自身有防环逻辑；移除后应用流量（含 FileServer）由隧道承载，
+            // frpc/API 等公网流量仍走底层网络（VPN 未设默认路由）。
 
         // 虚拟网段自身 + 各节点 proxy_cidrs
         builder.addRoute(ip, 32)
@@ -100,7 +105,17 @@ class LunaVpnService : VpnService() {
 
         vpnInterface = builder.establish()
         if (vpnInterface == null) {
+            // 典型原因：重装/清数据后 ACTIVATE_VPN appops 丢失，系统拒绝建隧。
+            // 若只记日志，核心会卡在 coreRunning=true，连带把 frpc 隧道全部互斥暂停，
+            // 表现为「组网一直在连接中、frpc 起不来」。这里复位核心 + 明确报错，
+            // 让 frpc 恢复可用，并引导用户重新授权（见 NetworkScreen 的 VpnService.prepare）。
             EasyTierStateHolder.addLog("establish() 返回 null（VPN 授权被拒或参数非法）")
+            EasyTierStateHolder.setVpnRunning(false)
+            EasyTierManager.stop(applicationContext, silent = true)
+            EasyTierStateHolder.setError(
+                "VPN 授权失败：establish() 返回 null（缺少 VPN 权限）。" +
+                "请点击下方「授予 VPN 权限并重试」，或前往系统设置授予 LunaShare VPN 权限后重试。"
+            )
             stopSelf()
             return
         }
@@ -173,6 +188,16 @@ class LunaVpnService : VpnService() {
         FgNotificationHelper.clearVpn()
         FgNotificationHelper.refresh(this)
         Log.i(TAG, "VPN 接口已清理")
+    }
+
+    override fun onRevoke() {
+        // VPN 被系统收回（用户撤销权限 / 系统回收）：组网通道没了，
+        // 清理任何残留 frpc 隧道孤儿进程，避免它们继续占用端口/向服务器注册。
+        // 不依赖 ShareService 的内存 Map，直接进程扫描（killAllStaleProcesses 内部已容错）。
+        Log.w(TAG, "VPN 被系统收回，清理残留 frpc 隧道进程")
+        thread { FrpcManager.killAllStaleProcesses(applicationContext.filesDir) }
+        super.onRevoke()
+        cleanup()
     }
 
     override fun onDestroy() {

@@ -3,41 +3,38 @@ package com.lunashare.app.frpc.mefrp
 import android.content.Context
 import android.util.Log
 import java.io.File
-import java.io.InputStream
-import java.io.OutputStream
-import java.net.Inet4Address
 import java.net.InetAddress
-import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import javax.net.ssl.HttpsURLConnection
 
 /**
- * 本地 HTTP CONNECT 代理网关（仅监听 127.0.0.1）。
+ * 本地 HTTP 反向代理（仅监听 127.0.0.1），专治 mefrpc 硬编码 8.8.8.8 被墙。
  *
- * 根因：mefrpc 是纯 Go 静态二进制（CGO_ENABLED=0），不读取 Android 系统 DNS，
- * 只硬编码 8.8.8.8:53 做域名解析，而 8.8.8.8 在国行网络下被拦截，导致
- * `lookup api.mefrp.com ... 8.8.8.8:53: i/o timeout`。此外部分手机网络把
- * api.mefrp.com 解析成 IPv6，而手机无 IPv6 → `dial tcp [2409:...]:443: network
- * is unreachable`。两种情况下隧道都起不来，UI 却可能显示「成功」（假象）。
+ * 根因：mefrpc（Go CGO_ENABLED=0）不读系统 DNS、也不读 env 代理（Go net/http 默认
+ * client 不应用 HTTPS_PROXY），只读不存在的 /etc/resolv.conf，回退硬编码 8.8.8.8:53
+ * → api.mefrp.com 解析超时，控制面起不来。本地 CONNECT 代理方案同样无效（mefrpc 不
+ * 发 CONNECT、且不读 env proxy）。
  *
- * 方案：在 App 进程内起一个本地 CONNECT 代理，对 CONNECT 目标用 Android 系统 DNS
- * （InetAddress.getByName，走手机当前网络 DNS）解析，且**强制只取 IPv4 A 记录**
- * （过滤掉 IPv6），再建立 TCP 隧道转发。启动 mefrpc 时注入
- * HTTPS_PROXY=http://127.0.0.1:<port>，使其所有 https 请求经此代理。这样 mefrpc
- * 发出的 Host/SNI 仍是 api.mefrp.com（代理只做 TCP 隧道、不碰 TLS），既绕过 8.8.8.8
- * 与 IPv6 unreachable，又不被 CDN 因 Host=IP 拒绝，且不改动系统 / WiFi 的 DNS 设置。
+ * 方案：App 内起一个本地 HTTP 服务器；启动 mefrpc 时注入
+ * `--api-root-url http://127.0.0.1:<port>`（配合 --skip-cert-verify）。mefrpc 控制面
+ * 请求连 127.0.0.1（IP，无需 DNS 解析），本代理收到后用 Android 系统 DNS 解析
+ * api.mefrp.com 并真实连 https://api.mefrp.com<path>（Host/SNI=api.mefrp.com，CDN 友好），
+ * 把响应回传。这样绕开 8.8.8.8，又不被 CDN 因 Host=IP 拒绝。
  *
- * 每次 CONNECT 都会把 host / 解析到的 IPv4 / 成败写进 files/frpc/proxy_gateway.log，
- * 便于排查 mefrpc 到底有没有走代理（若文件里没有任何 api.mefrp.com 的 CONNECT 记录，
- * 说明 mefrpc 根本不读 HTTPS_PROXY，需改用 patch 二进制 DNS 的方案）。
+ * 节点连接（TCP/TLS，由服务端下发的 IP）不走本代理，仍由 mefrpc 直连；本代理只承载
+ * 控制面 API（easyStartup / getProxyConfig 等）。每次转发都写 proxy_gateway.log，便于
+ * 排查 mefrpc 是否真的经本代理（应有 `FWD-OK ... -> 200` 记录）。
  */
 object MefrpProxyGateway {
     private const val TAG = "MefrpProxyGateway"
+    private const val TARGET_HOST = "api.mefrp.com"
     private val executor = Executors.newCachedThreadPool()
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var localPort: Int = 0
@@ -51,7 +48,7 @@ object MefrpProxyGateway {
         val ss = ServerSocket(0, 0, InetAddress.getByName("127.0.0.1"))
         localPort = ss.localPort
         serverSocket = ss
-        Log.i(TAG, "本地代理已启动 127.0.0.1:$localPort（系统 DNS 强制 IPv4，绕过 8.8.8.8/IPv6）")
+        Log.i(TAG, "本地 mefrp 反向代理已启动 127.0.0.1:$localPort（系统 DNS 解析 api.mefrp.com）")
         appendLog("GATEWAY START 127.0.0.1:$localPort")
         executor.execute { acceptLoop(ss) }
         return localPort
@@ -62,7 +59,7 @@ object MefrpProxyGateway {
         try { serverSocket?.close() } catch (_: Exception) { /* ignore */ }
         serverSocket = null
         localPort = 0
-        Log.i(TAG, "本地代理已停止")
+        Log.i(TAG, "本地 mefrp 反向代理已停止")
     }
 
     private fun appendLog(line: String) {
@@ -80,96 +77,107 @@ object MefrpProxyGateway {
         }
     }
 
+    /**
+     * 处理一个 mefrpc 控制面请求：读请求行 + 头 + body（逐字节读头，避免 BufferedReader
+     * 预读 body），用系统 DNS 真实连 https://api.mefrp.com<path> 转发，回写响应。
+     */
     private fun handle(client: Socket) {
         try {
             val inp = client.getInputStream()
             val out = client.getOutputStream()
-
             val requestLine = readLine(inp) ?: run { client.close(); return }
             val parts = requestLine.split(" ")
-            if (parts.size < 2 || !parts[0].equals("CONNECT", true)) {
-                out.write("HTTP/1.1 405 Method Not Allowed\r\n\r\n".toByteArray())
-                out.flush()
-                client.close()
-                return
-            }
-            // 读完剩余请求头（直到空行），避免把头文本当成 TLS 数据转发
+            if (parts.size < 2) { client.close(); return }
+            val method = parts[0]
+            val path = parts[1]
+            // 读请求头
+            val headers = mutableMapOf<String, String>()
             while (true) {
                 val h = readLine(inp) ?: break
                 if (h.isEmpty()) break
+                val idx = h.indexOf(':')
+                if (idx > 0) headers[h.substring(0, idx).trim().lowercase()] = h.substring(idx + 1).trim()
             }
-
-            val hostPort = parts[1]
-            val (host, p) = hostPort.split(":", limit = 2).let {
-                it[0] to (it.getOrNull(1)?.toIntOrNull() ?: 443)
-            }
-            // 强制 IPv4：过滤掉 IPv6（部分手机网络无 IPv6，Go 解析出 IPv6 会 network unreachable）
-            val addr = resolveIpv4(host)
-            if (addr == null) {
-                appendLog("RESOLVE-FAIL $host (no A record via system DNS)")
-                out.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
-                out.flush()
-                client.close()
-                return
-            }
-            appendLog("CONNECT $host -> ${addr.hostAddress}:$p")
-            val remote = Socket()
-            try {
-                remote.connect(InetSocketAddress(addr, p), 15000)
-            } catch (e: Exception) {
-                appendLog("CONNECT-FAIL $host -> ${addr.hostAddress}:$p : ${e.message}")
-                out.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
-                out.flush()
-                client.close()
-                return
-            }
-            out.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
-            out.flush()
-            appendLog("TUNNEL-UP $host -> ${addr.hostAddress}:$p")
-
-            val r1 = pipe(remote.getInputStream(), client.getOutputStream())
-            val r2 = pipe(client.getInputStream(), remote.getOutputStream())
-            try { r1.join() } catch (_: Exception) { /* ignore */ }
-            try { r2.join() } catch (_: Exception) { /* ignore */ }
-            try { remote.close() } catch (_: Exception) { /* ignore */ }
-            try { client.close() } catch (_: Exception) { /* ignore */ }
-        } catch (e: Exception) {
-            Log.w(TAG, "代理处理异常: ${e.message}")
-            try { client.close() } catch (_: Exception) { /* ignore */ }
-        }
-    }
-
-    /** 仅取 IPv4 A 记录；若系统 DNS 只返回 IPv6，回退到 getAllByName 兜底（仍可能失败，但日志可见）。 */
-    private fun resolveIpv4(host: String): InetAddress? {
-        return try {
-            InetAddress.getAllByName(host).firstOrNull { it is Inet4Address }
-                ?: InetAddress.getByName(host)
-        } catch (e: Exception) {
-            appendLog("RESOLVE-EX $host : ${e.message}")
-            null
-        }
-    }
-
-    /** 双向转发线程：从 `in` 读，写到 out，直到对端关闭。 */
-    private fun pipe(`in`: InputStream, out: OutputStream): Thread {
-        val t = object : Thread() {
-            override fun run() {
-                val buf = ByteArray(16 * 1024)
-                var n: Int
-                try {
-                    while (`in`.read(buf).also { n = it } > 0) {
-                        out.write(buf, 0, n)
-                        out.flush()
+            // 读 body（按 Content-Length）
+            val body = headers["content-length"]?.toIntOrNull()?.let { len ->
+                if (len > 0) {
+                    val buf = ByteArray(len)
+                    var off = 0
+                    while (off < len) {
+                        val n = inp.read(buf, off, len - off)
+                        if (n < 0) break
+                        off += n
                     }
-                } catch (_: Exception) { /* ignore */ }
+                    buf.copyOf(off)
+                } else null
             }
+
+            appendLog("FWD $method $path")
+            val url = "https://$TARGET_HOST$path"
+            val conn = try {
+                (URL(url).openConnection() as HttpsURLConnection).apply {
+                    requestMethod = method
+                    connectTimeout = 20000
+                    readTimeout = 20000
+                    doInput = true
+                    for ((k, v) in headers) {
+                        if (k !in setOf("host", "content-length", "connection", "proxy-connection", "accept-encoding"))
+                            setRequestProperty(k, v)
+                    }
+                    if (body != null) {
+                        doOutput = true
+                        outputStream.write(body)
+                    }
+                }
+            } catch (e: Exception) {
+                appendLog("FWD-FAIL $method $path : ${e.message}")
+                out.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
+                out.flush(); client.close(); return
+            }
+
+            val code = runCatching { conn.responseCode }.getOrElse {
+                appendLog("FWD-FAIL $method $path : ${it.message}")
+                out.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
+                out.flush(); client.close(); return
+            }
+            val respBody = runCatching { conn.inputStream.buffered().readBytes() }.getOrElse {
+                runCatching { conn.errorStream?.buffered()?.readBytes() ?: ByteArray(0) }.getOrElse { ByteArray(0) }
+            }
+            out.write("HTTP/1.1 $code ${statusText(code)}\r\n".toByteArray())
+            out.write("Content-Length: ${respBody.size}\r\n".toByteArray())
+            out.write("Connection: close\r\n\r\n".toByteArray())
+            if (respBody.isNotEmpty()) out.write(respBody)
+            out.flush()
+            appendLog("FWD-OK $method $path -> $code (${respBody.size}B)")
+            runCatching { client.close() }
+        } catch (e: Exception) {
+            Log.w(TAG, "代理异常: ${e.message}")
+            runCatching { client.close() }
         }
-        t.start()
-        return t
     }
 
-    /** 逐字节读一行（无缓冲，避免超前消费 TLS 数据），空行返回空字符串。 */
-    private fun readLine(`in`: InputStream): String? {
+    private fun statusText(code: Int): String = when (code) {
+        200 -> "OK"
+        201 -> "Created"
+        202 -> "Accepted"
+        204 -> "No Content"
+        301 -> "Moved Permanently"
+        302 -> "Found"
+        400 -> "Bad Request"
+        401 -> "Unauthorized"
+        403 -> "Forbidden"
+        404 -> "Not Found"
+        422 -> "Unprocessable Entity"
+        429 -> "Too Many Requests"
+        500 -> "Internal Server Error"
+        502 -> "Bad Gateway"
+        503 -> "Service Unavailable"
+        504 -> "Gateway Timeout"
+        else -> "Status $code"
+    }
+
+    /** 逐字节读一行（无缓冲，避免超前消费 body），空行返回空字符串。 */
+    private fun readLine(`in`: java.io.InputStream): String? {
         val sb = StringBuilder()
         var c: Int
         while (`in`.read().also { c = it } != -1) {

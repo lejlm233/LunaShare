@@ -16,6 +16,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.app.Activity
+import android.net.VpnService
 import kotlinx.coroutines.launch
 
 /**
@@ -58,6 +60,25 @@ fun NetworkScreen() {
     var tomlMode by remember { mutableStateOf(false) }
 
     fun msg(s: String) = scope.launch { snackbar.showSnackbar(s) }
+
+    // VPN 授权引导：establish() 返回 null（重装/清数据后 ACTIVATE_VPN 丢失）时，
+    // 用户点「授予 VPN 权限并重试」走 VpnService.prepare() 弹系统授权窗，允许后
+    // ACTIVATE_VPN 持久化，下次 establish 即能通过。注意：部分定制系统对侧载 debug
+    // 应用调 prepare() 可能直接 SIGKILL 进程，此时需改正式签名包或系统设置手动授权。
+    var pendingVpnToml by remember { mutableStateOf<String?>(null) }
+    val vpnPrepareLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val toml = pendingVpnToml
+        pendingVpnToml = null
+        if (result.resultCode == Activity.RESULT_OK && toml != null) {
+            EasyTierManager.start(context, toml)
+            msg("VPN 授权成功，正在建立组网...")
+        } else {
+            EasyTierStateHolder.setError("VPN 授权被拒绝，无法建立组网隧道（establish 将返回 null）")
+            msg("VPN 授权被拒绝")
+        }
+    }
 
     // TOML 导入：解析 → 填充可编辑表单；未知字段提示（原文模式可保留）
     val tomlPicker = rememberLauncherForActivityResult(
@@ -122,6 +143,10 @@ fun NetworkScreen() {
      * 自行校验该授权即可通过。因此这里跳过 prepare() 直接启动核心；
      * 若从未授权，LunaVpnService.establish() 会返回 null 并在日志卡提示。
      */
+    fun currentToml(): String =
+        (if (tomlMode) EasyTierStateHolder.get().importedToml else null)
+            ?: EasyTierManager.buildToml(currentCfg())
+
     fun startWithConsent() {
         if (tomlMode && state.importedToml.isNullOrBlank() && networkName.isBlank()) {
             msg("请先填写网络名或导入 TOML")
@@ -132,9 +157,28 @@ fun NetworkScreen() {
             return
         }
         EasyTierManager.saveConfig(context, currentCfg())
-        val toml = (if (tomlMode) EasyTierStateHolder.get().importedToml else null)
-            ?: EasyTierManager.buildToml(currentCfg())
-        EasyTierManager.start(context, toml)
+        EasyTierManager.start(context, currentToml())
+    }
+
+    /** 引导系统 VPN 授权窗；授权成功后真正启动组网核心。供错误区的「授予 VPN 权限」按钮用。 */
+    fun requestVpnAuth() {
+        if (tomlMode && state.importedToml.isNullOrBlank() && networkName.isBlank()) {
+            msg("请先填写网络名或导入 TOML")
+            return
+        }
+        if (!tomlMode && networkName.isBlank()) {
+            msg("请先填写网络名")
+            return
+        }
+        EasyTierManager.saveConfig(context, currentCfg())
+        // 已授权则 prepare() 返回 null，直接启动；否则弹系统授权窗，回调里再启动。
+        val prep = runCatching { VpnService.prepare(context) }.getOrNull()
+        if (prep == null) {
+            EasyTierManager.start(context, currentToml())
+        } else {
+            pendingVpnToml = currentToml()
+            vpnPrepareLauncher.launch(prep)
+        }
     }
 
     Scaffold(snackbarHost = { SnackbarHost(snackbar) }) { padding ->
@@ -197,8 +241,17 @@ fun NetworkScreen() {
                     Text(
                         it, color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 4.dp)
                     )
+                    // 授权丢失（establish 返回 null）时给一条明确的恢复路径
+                    if (!state.coreRunning) {
+                        Button(
+                            onClick = { requestVpnAuth() },
+                            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
+                        ) {
+                            Text("授予 VPN 权限并重试")
+                        }
+                    }
                 }
             }
 

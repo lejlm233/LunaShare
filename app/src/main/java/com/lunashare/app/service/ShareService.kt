@@ -27,6 +27,7 @@ import com.lunashare.app.frpc.mefrp.MefrpConfigStore
 import com.lunashare.app.frpc.mefrp.MefrpDnsHelper
 import com.lunashare.app.frpc.model.OpenFrpProxy
 import com.lunashare.app.model.ShareConfig
+import com.lunashare.app.easytier.EasyTierStateHolder
 import com.lunashare.app.MainActivity
 import kotlinx.coroutines.*
 import java.io.File
@@ -98,6 +99,11 @@ class ShareService : Service() {
     /** 观察 ADB 隧道 proxyId 的 frpc 状态，桥接到 AdbTunnelStateHolder。 */
     private var adbObserverJob: Job? = null
 
+    /** 观察组网核心激活状态，驱动「组网开→暂停共享 frpc / 组网关→恢复」。 */
+    private var networkObserverJob: Job? = null
+    /** 被组网暂停、待组网关闭后恢复的共享 frpc 隧道 proxyId 集合（线程安全）。 */
+    private val networkPausedProxyIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var configStore: ShareConfigStore
 
@@ -121,6 +127,7 @@ class ShareService : Service() {
         acquireWakeLock()
         startFrpcStateObserver()
         startAdbTunnelStateObserver()
+        startNetworkObserver()
         Log.d(TAG, "ShareService created")
     }
 
@@ -365,7 +372,17 @@ class ShareService : Service() {
         // mefrp 隧道会永远不启动（令牌缺失由 startFrpcTunnels 循环内逐隧道检查并如实报错）。
         val activeTunnels = config.activeTunnels()
         if (activeTunnels.isNotEmpty()) {
-            startFrpcTunnels(shareId, config, activeTunnels)
+            if (EasyTierStateHolder.get().coreRunning) {
+                // 组网已开启：公网隧道无意义且可能与组网冲突，跳过启动并登记待恢复
+                activeTunnels.forEach { (_, t) -> networkPausedProxyIds.add(t.proxyId) }
+                ShareStateHolder.addFrpcHttpLog(
+                    shareId,
+                    "组网已开启，已跳过公网隧道（关闭组网后自动恢复）"
+                )
+                Log.i(TAG, "组网已开启，跳过共享 frpc 隧道 [$shareId]（关闭组网后恢复）")
+            } else {
+                startFrpcTunnels(shareId, config, activeTunnels)
+            }
         }
 
         // ── mDNS 广播（开共享后用 lunashare.local 让同网设备访问本机）──
@@ -666,8 +683,96 @@ class ShareService : Service() {
         }
     }
 
+    // ── 组网 ↔ 公网隧道互斥协调 ───────────────────────────────────
+    // 用户使用场景：frpc 公网隧道与 EasyTier 组网不会同时使用。组网开启时，
+    // 暂停所有正在运行的共享公网隧道（避免两路隧道并存/冲突）；组网关闭后，
+    // 自动把被暂停的隧道恢复（恢复前提是共享本身仍在使用中）。
+
+    /**
+     * 观察组网核心激活状态（EasyTierStateHolder.coreRunning）的变化：
+     * false→true 暂停所有共享 frpc 隧道；true→false 恢复。
+     */
+    private fun startNetworkObserver() {
+        networkObserverJob = scope.launch(Dispatchers.Default) {
+            // 以当前值作为初态，避免首帧重复触发
+            var prev = EasyTierStateHolder.get().coreRunning
+            EasyTierStateHolder.state.collect { st ->
+                val active = st.coreRunning
+                if (active == prev) return@collect
+                prev = active
+                if (active) pauseShareFrpcForNetwork()
+                else resumeShareFrpcForNetwork()
+            }
+        }
+    }
+
+    /** 组网开启：暂停所有运行中的共享 frpc 隧道 + ADB 穿透隧道，并记录待恢复列表。 */
+    private suspend fun pauseShareFrpcForNetwork() {
+        var paused = 0
+        for (config in configStore.listConfigs()) {
+            for ((service, tunnel) in config.activeTunnels()) {
+                if (frpcManager.isRunning(tunnel.proxyId)) {
+                    networkPausedProxyIds.add(tunnel.proxyId)
+                    frpcManager.stopTunnel(tunnel.proxyId)
+                    paused++
+                    ShareStateHolder.addFrpcHttpLog(
+                        config.id,
+                        "组网已开启：暂停 $service 公网隧道（proxyId=${tunnel.proxyId}，关闭组网后自动恢复）"
+                    )
+                }
+            }
+        }
+        // ADB 穿透隧道同样走 frpcManager（独立 proxyId），一并暂停
+        val adbCfg = adbTunnelStore.loadConfig()
+        if (adbCfg != null && adbCfg.proxyId > 0 && frpcManager.isRunning(adbCfg.proxyId)) {
+            networkPausedProxyIds.add(adbCfg.proxyId)
+            frpcManager.stopTunnel(adbCfg.proxyId)
+            paused++
+            AdbTunnelStateHolder.addLog(
+                "组网已开启：暂停 ADB 穿透隧道（proxyId=${adbCfg.proxyId}，关闭组网后自动恢复）"
+            )
+            Log.i(TAG, "组网已开启，暂停 ADB 穿透隧道 proxyId=${adbCfg.proxyId}")
+        }
+        if (paused > 0) {
+            Log.i(TAG, "组网已开启，暂停了 $paused 条公网隧道（含共享+ADB）")
+            updateNotification()
+        }
+    }
+
+    /** 组网关闭：把被暂停的共享 frpc 隧道 + ADB 穿透隧道恢复（仍在使用才恢复）。 */
+    private suspend fun resumeShareFrpcForNetwork() {
+        val pending = networkPausedProxyIds.toList()
+        networkPausedProxyIds.clear()
+        for (proxyId in pending) {
+            // 先尝试匹配共享配置里的隧道
+            val config = configStore.listConfigs().firstOrNull { c ->
+                c.activeTunnels().any { (_, t) -> t.proxyId == proxyId }
+            }
+            if (config != null) {
+                // 共享自身已停止（用户手动停 / 删除）则不再拉起该隧道
+                if (!ShareStateHolder.getState(config.id).isAnyRunning) {
+                    Log.d(TAG, "组网关闭，跳过恢复 proxyId=$proxyId（共享 ${config.id} 已停止）")
+                    continue
+                }
+                val tunnels = config.activeTunnels().filter { (_, t) -> t.proxyId == proxyId }
+                startFrpcTunnels(config.id, config, tunnels)
+                Log.i(TAG, "组网关闭，恢复共享公网隧道 proxyId=$proxyId（共享 ${config.id}）")
+                continue
+            }
+            // 否则按 ADB 穿透隧道处理（proxyId 不在共享配置里）
+            val adbCfg = adbTunnelStore.loadConfig()
+            if (adbCfg != null && adbCfg.proxyId == proxyId) {
+                // 配置仍在 → 重启（stopAdbTunnel 已清除登记，能到这说明确实仍启用）
+                startAdbTunnel()
+                Log.i(TAG, "组网关闭，恢复 ADB 穿透隧道 proxyId=$proxyId")
+            }
+        }
+        if (pending.isNotEmpty()) updateNotification()
+    }
+
     private suspend fun stopFrpcTunnelsForShare(config: ShareConfig) {
         config.activeTunnels().forEach { (_, tunnel) ->
+            networkPausedProxyIds.remove(tunnel.proxyId)
             frpcManager.stopTunnel(tunnel.proxyId)
         }
     }
@@ -686,6 +791,16 @@ class ShareService : Service() {
             Log.w(TAG, msg)
             AdbTunnelStateHolder.addLog(msg)
             AdbTunnelStateHolder.setError(msg)
+            return
+        }
+
+        // 组网已开启时，frpc 公网隧道与组网互斥：跳过 ADB 隧道启动并登记，组网关后自动恢复
+        if (EasyTierStateHolder.get().coreRunning) {
+            networkPausedProxyIds.add(cfg.proxyId)
+            AdbTunnelStateHolder.addLog(
+                "组网已开启：跳过 ADB 穿透隧道启动（proxyId=${cfg.proxyId}，关闭组网后自动恢复）"
+            )
+            Log.i(TAG, "组网已开启，跳过 ADB 隧道启动 proxyId=${cfg.proxyId}")
             return
         }
 
@@ -803,7 +918,10 @@ class ShareService : Service() {
 
     private suspend fun stopAdbTunnel() {
         val cfg = adbTunnelStore.loadConfig()
-        cfg?.proxyId?.takeIf { it > 0 }?.let { frpcManager.stopTunnel(it) }
+        cfg?.proxyId?.takeIf { it > 0 }?.let {
+            networkPausedProxyIds.remove(it) // 用户主动停 ADB：从组网待恢复列表移除，避免组网关后误恢复
+            frpcManager.stopTunnel(it)
+        }
         adbTunnelRunning = false
         AdbTunnelStateHolder.setTunnelRunning(false)
         AdbTunnelStateHolder.setEnabled(false)
@@ -1007,6 +1125,7 @@ class ShareService : Service() {
 
         // Stop all OpenFrp frpc tunnels
         frpcManager.stopAll()
+        networkPausedProxyIds.clear() // 全部共享已停，清空待恢复列表
 
         // Stop ADB tunnel (if running) and reset its state
         if (adbTunnelRunning) {
@@ -1155,6 +1274,8 @@ class ShareService : Service() {
         SmbServerManager.stop()
         frpcObserverJob?.cancel()
         adbObserverJob?.cancel()
+        networkObserverJob?.cancel()
+        networkPausedProxyIds.clear() // 服务销毁，清空待恢复列表
         adbTunnelRunning = false
         AdbTunnelStateHolder.setTunnelRunning(false)
         runBlocking { frpcManager.stopAll() }
