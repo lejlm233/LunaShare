@@ -125,6 +125,11 @@ const val ZCODE_WATCHER_JS = """
     if (window.__lunaZcodeWatcher) return;
     window.__lunaZcodeWatcher = true;
 
+    // 最近一次收到「任务/中继数据」的时刻。宿主在前台回归时读它判断页面的数据通道
+    // （中继 WebSocket）是否还活着：活着就不必为「长时间后台」做过期重载（见
+    // LinkWebViewRegistry.pageDataAgeMs）。初值 = 注入时刻，重载/首开即为新鲜。
+    window.__lunaDataAt = Date.now();
+
     function classifyStatus(status){
       var s = String(status||'').toLowerCase();
       if(!s) return null;
@@ -337,6 +342,7 @@ const val ZCODE_WATCHER_JS = """
               scanTaskish(result,0,hits);
               if(hits.found.length) ingestFrom('tap', hits.found);
               if(hits.pend.length) ingestFrom('tap-pend', hits.pend);
+              if(hits.found.length || hits.pend.length){ try{ window.__lunaDataAt = Date.now(); }catch(e){} }
             }
           }catch(e){}
           return result;
@@ -714,7 +720,7 @@ const val ZCODE_WATCHER_JS = """
     try{
       var RealWS = window.WebSocket;
       function watchWs(ws){
-        ws.addEventListener('message', tick);
+        ws.addEventListener('message', function(){ try{ window.__lunaDataAt = Date.now(); }catch(e){} tick(); });
         ws.addEventListener('open', function(){ lastReconnectAt = 0; });
       }
       var WsWrapper = function(url, proto){ var ws = proto===undefined? new RealWS(url): new RealWS(url,proto); watchWs(ws); return ws; };

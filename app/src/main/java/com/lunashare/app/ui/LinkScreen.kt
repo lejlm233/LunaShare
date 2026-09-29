@@ -114,6 +114,14 @@ private fun resetWebViewZoom(wv: WebView) {
 private const val ZCODE_OPT_CSS =
     "(function(){try{var s=document.getElementById('luna-zcode-opt');if(!s){s=document.createElement('style');s.id='luna-zcode-opt';(document.head||document.documentElement).appendChild(s);}s.textContent='html,body{overscroll-behavior:none;-webkit-tap-highlight-color:transparent;}';}catch(e){}})();"
 
+// ── zcode 页面「过期重同步」参数 ─────────────────────────────────────────────
+/** 后台暴露超过该时长，才认为页面的中继 WebSocket 可能已死（短后台页面自己扛得住） */
+private const val ZCODE_STALE_BG_MS = 90_000L
+/** 重载判定前的观察窗：给存活通道 / 页面自身快速重连留出数据送达时间 */
+private const val ZCODE_STALE_PROBE_DELAY_MS = 1_500L
+/** 观察窗内页面数据年龄小于此值 = 通道活着（或已自愈），不重载 */
+private const val ZCODE_DATA_FRESH_MS = 45_000L
+
 /**
  * 复刻 HermesMobile 的「主页(连接) + WebActivity(WebView)」逻辑，作为一个 link Tab。
  *
@@ -290,8 +298,18 @@ fun LinkScreen(
     DisposableEffect(lifecycleOwnerForVisible) {
         val obs = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_START -> appInForeground = true
-                Lifecycle.Event.ON_STOP -> appInForeground = false
+                Lifecycle.Event.ON_START -> {
+                    appInForeground = true
+                    // 记录前台 Episode 起点，供 zcode 页「过期重同步」计算后台暴露时长
+                    LinkWebViewRegistry.markForegroundEntered(System.currentTimeMillis())
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    appInForeground = false
+                    // 长时间后台（cached freezer 冻结 / Doze 断网）会让页面的中继 WebSocket
+                    // 悄然死亡：盖「进后台」时间戳，前台回归激活 zcode 页面时按需 reload
+                    // 重同步（见下方「过期重同步」LaunchedEffect）
+                    LinkWebViewRegistry.markAllBackgrounded(System.currentTimeMillis())
+                }
                 else -> {}
             }
         }
@@ -686,6 +704,36 @@ fun LinkScreen(
                     // 页面（如 zcode 的 WebSocket）在恢复时会误判断线触发重连
                     wv.onPause()
                 }
+            }
+        }
+
+        // zcode 页面「过期重同步」：长时间后台（cached freezer 冻结 / Doze 断网）会让页面的
+        // 中继 WebSocket 悄然死亡，而页面自己的断线检测 + 重连退避恢复很慢 —— 现象就是
+        // 「电脑端早已完成任务，打开 Link 页面还停在旧进度（如 50%）」。前台回归激活该页面时：
+        //  后台暴露 ≥ 阈值 → 观察窗后探一次页面数据新鲜度（给存活通道 / 页面自身快速重连留时间），
+        //  数据仍陈旧（或探不到）→ 直接 reload 重同步。会话在服务端、任务不受影响，重载完
+        //  必然是最新状态，比等页面自己爬完重连退避快得多。
+        // 键含 appInForeground：ON_START 回前台时若停在 Link，本效果立即重跑完成评估。
+        LaunchedEffect(appInForeground, active, currentUrl) {
+            if (!appInForeground || !active) return@LaunchedEffect
+            val url = currentUrl ?: return@LaunchedEffect
+            if (!isZcode(url)) return@LaunchedEffect
+            val wv = LinkWebViewRegistry.getWebView(url) ?: return@LaunchedEffect
+            if (wv.url.isNullOrEmpty()) return@LaunchedEffect // 已由上方切换恢复逻辑兜底 loadUrl
+            val since = LinkWebViewRegistry.staleSinceMs(url) ?: return@LaunchedEffect
+            val entered = LinkWebViewRegistry.foregroundEnteredAtMs
+            // 用「前台回归时刻 - 盖戳时刻」而非 now - 盖戳：回前台后页面随 App 一起恢复收数据，
+            // 在其它 Tab 停留越久越可能已自愈；自愈与否由下面的数据新鲜度探针说话
+            val bgExposure = if (entered > since) entered - since else System.currentTimeMillis() - since
+            if (bgExposure < ZCODE_STALE_BG_MS) return@LaunchedEffect
+            delay(ZCODE_STALE_PROBE_DELAY_MS)
+            val dataAge = LinkWebViewRegistry.pageDataAgeMs(url)
+            LinkWebViewRegistry.clearStale(url)
+            // 数据仍新鲜 = 通道其实活着（如 ShareService 前台保住进程不冻结、WS 一直通）→ 不打扰
+            if (dataAge != null && dataAge < ZCODE_DATA_FRESH_MS) return@LaunchedEffect
+            try {
+                wv.reload()
+            } catch (_: Exception) {
             }
         }
 

@@ -27,6 +27,9 @@ import com.lunashare.app.link.LinkDownloadManager
 import com.lunashare.app.link.ZcodeEventBridge
 import com.lunashare.app.link.ZcodePageAdapter
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.suspendCancellableCoroutine
+import org.json.JSONObject
+import kotlin.coroutines.resume
 
 /**
  * Link Tab WebView 实例常驻容器（方案 B：跨 Activity 重建不重载）。
@@ -246,11 +249,76 @@ object LinkWebViewRegistry {
          * 决定原生右侧悬浮胶囊面板是否隐藏——按钮已注入 zcode 标题栏右侧。
          */
         var isZcodeTitlebar: Boolean = false,
+        /**
+         * 「进后台」时间戳（System.currentTimeMillis()，0 = 未盖戳）。App 每次 ON_STOP 由
+         * [markAllBackgrounded] 盖戳：长时间后台（cached freezer 冻结 / Doze 断网）会让页面的
+         * 中继 WebSocket 悄然死亡，而页面自己的断线检测 + 重连退避恢复很慢 —— 前台回归激活
+         * zcode 页面时由宿主按此判断是否要 reload 重同步（见 LinkScreen 的过期重同步逻辑）。
+         */
+        var staleSinceMs: Long = 0L,
     )
 
     fun getEntry(url: String?): Entry? = entries[url]
     fun getWebView(url: String?): WebView? = entries[url]?.webView
     fun contains(url: String): Boolean = entries.containsKey(url)
+
+    // ── 长时间后台后的「过期重同步」支持 ────────────────────────────────────────
+    // 长时间后台会经历 cached app freezer 冻结 / Doze 断网，页面的中继 WebSocket 大概率已死，
+    // 而页面自己的断线检测 + 重连退避在恢复后要爬很久。宿主在 ON_STOP 盖戳、前台回归激活
+    // zcode 页面时评估（后台暴露时长 + 页面数据新鲜度探针）并按需 reload。
+
+    /** 本次前台 Episode 的起点（ON_START）；配合 [Entry.staleSinceMs] 计算「后台暴露时长」 */
+    var foregroundEnteredAtMs: Long = 0L
+
+    /** App 退到后台（ON_STOP）：给所有页面盖「进后台」时间戳（同一后台 Episode 以后一次为准）。 */
+    fun markAllBackgrounded(atMs: Long) {
+        entries.values.forEach { it.staleSinceMs = atMs }
+    }
+
+    /** App 回到前台（ON_START）：记录本次前台 Episode 起点。 */
+    fun markForegroundEntered(atMs: Long) {
+        foregroundEnteredAtMs = atMs
+    }
+
+    /** 该页面的「进后台」时间戳；未盖戳返回 null。 */
+    fun staleSinceMs(url: String): Long? =
+        entries[url]?.staleSinceMs?.takeIf { it > 0L }
+
+    /** 清掉盖戳（重载决定已做出，或本轮已确认页面数据通道存活）。 */
+    fun clearStale(url: String) {
+        entries[url]?.staleSinceMs = 0L
+    }
+
+    /**
+     * 读取页面「最近一次收到任务/中继数据」距今的毫秒数（window.__lunaDataAt，
+     * 由 ZCODE_WATCHER_JS 在中继 WS 消息与任务数据到达时盖章）。
+     *
+     * 这是重载判定前的「存活证据」：后台期间若进程被前台服务保住没冻结（如 ShareService 在跑）、
+     * WS 一直通着，页面其实没过期 —— 数据年龄小就不该打扰。返回 null = 不可知
+     * （页面未注入脚本 / 读取失败），调用方退化为纯时间阈值判断。
+     */
+    suspend fun pageDataAgeMs(url: String): Long? = suspendCancellableCoroutine { cont ->
+        val wv = entries[url]?.webView
+        if (wv == null) {
+            cont.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        try {
+            wv.evaluateJavascript(
+                "(function(){try{return {at:(window.__lunaDataAt||0),now:Date.now()}}catch(e){return null}})()"
+            ) { r ->
+                val age = runCatching {
+                    val o = JSONObject(r ?: "")
+                    val at = o.optLong("at", 0L)
+                    if (at <= 0L) null
+                    else (o.optLong("now", System.currentTimeMillis()) - at).coerceAtLeast(0L)
+                }.getOrNull()
+                if (cont.isActive) cont.resume(age)
+            }
+        } catch (_: Exception) {
+            if (cont.isActive) cont.resume(null)
+        }
+    }
 
     /**
      * 取或创建某地址的 WebView 实例（跨重建复用）。
