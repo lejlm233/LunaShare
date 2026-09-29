@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.res.Configuration
+import android.content.res.Resources
 import android.graphics.Bitmap
 import android.os.Build
 import android.net.Uri
@@ -159,18 +160,24 @@ object LinkWebViewRegistry {
     private fun nightContext(base: Context, dark: Boolean): Context {
         return try {
             val themeRes = if (dark) R.style.Theme_LunaShare_Dark else R.style.Theme_LunaShare
+            val cfg = Configuration(base.resources.configuration)
+            cfg.uiMode = (cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                if (dark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO
             if (base is Activity) {
-                // base 是 Activity：保留它的 window token——chromium 内部的 <select> 下拉
-                // 弹窗（PopupWindow/Dialog）用 WebView 的 context 创建，在部分 ROM
-                // （荣耀/华为魔改内核）上非 Activity context 会创建失败且被静默吞掉，
-                // 表现为「点下拉框没反应」。uiMode 覆盖在这条路上让位给 token：
-                // 主题仍由 ContextThemeWrapper 显式指定（isLightTheme 决定算法变暗），
-                // App 主题与系统日夜不一致时 prefers-color-scheme 可能跟系统走，可接受。
-                ContextThemeWrapper(base, themeRes)
+                // base 是 Activity：外层必须是 ContextThemeWrapper(base)——chromium 内部的
+                // <select> 下拉弹窗（PopupWindow/Dialog）用 WebView 的 context 创建，在部分
+                // ROM（荣耀/华为魔改内核）上非 Activity context 会创建失败且被静默吞掉
+                // （38dbbab 修的「点下拉框没反应」），所以不能整体换成 configuration context。
+                // 但 38dbbab 同时把这条路上的 uiMode 覆盖丢了 → prefers-color-scheme 只跟
+                // 系统日夜、不跟 App 主题设置（「zcode 页不再随 App 亮暗切换」的回归根源；
+                // Chromium 的 AwDarkMode 读的就是 context.getResources().getConfiguration().uiMode）。
+                // 这里在 ContextThemeWrapper 上覆写 getResources()，返回 uiMode 已覆盖的
+                // Resources：token 保留（下拉可用）与 uiMode 覆盖（亮暗跟 App）二者兼得。
+                object : ContextThemeWrapper(base, themeRes) {
+                    private val themedResources = base.createConfigurationContext(cfg).resources
+                    override fun getResources(): Resources = themedResources
+                }
             } else {
-                val cfg = Configuration(base.resources.configuration)
-                cfg.uiMode = (cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
-                    if (dark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO
                 ContextThemeWrapper(base.createConfigurationContext(cfg), themeRes)
             }
         } catch (_: Exception) {
