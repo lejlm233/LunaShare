@@ -113,20 +113,42 @@ fun MainScreen(
         topBar = {
             // Link Tab（主页或 WebView 页）及 WebView 全屏时隐藏 LunaShare 标题栏与设置按钮
             if (selectedTab != 3 && !linkFullscreen) {
-                TopAppBar(
-                    title = { Text("LunaShare") },
-                    actions = {
+                // 紧凑标题栏：M3 TopAppBar 规范最小 64dp，且其内置状态栏 inset 会与
+                // Scaffold 的顶部布局叠加（实测本机标题栏区域被双倍垫高到 ~140dp，占屏近 1/5），
+                // 改为 44dp 自绘行、**不再自行垫状态栏高度**（topBar 槽位已在状态栏下方起绘，
+                // 实测见 uiautomator bounds），只缩标题栏本体。
+                // 配色沿用 TopAppBar 默认的 surface，与 Scaffold 状态栏色带（background）一致。
+                Surface(color = MaterialTheme.colorScheme.surface) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                            .padding(horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "LunaShare",
+                            style = MaterialTheme.typography.titleLarge,
+                            modifier = Modifier.padding(start = 8.dp)
+                        )
+                        Spacer(Modifier.weight(1f))
                         // 红色电源按钮：退出 App（停止全部共享/隧道/服务并结束进程）
-                        IconButton(onClick = { showExitConfirm = true }) {
+                        IconButton(
+                            onClick = { showExitConfirm = true },
+                            modifier = Modifier.size(40.dp)
+                        ) {
                             Icon(Icons.Default.PowerSettingsNew,
                                 contentDescription = "退出 App",
                                 tint = MaterialTheme.colorScheme.error)
                         }
-                        IconButton(onClick = onSettings) {
+                        IconButton(
+                            onClick = onSettings,
+                            modifier = Modifier.size(40.dp)
+                        ) {
                             Icon(Icons.Default.Settings, contentDescription = "设置")
                         }
                     }
-                )
+                }
             }
         },
         bottomBar = {
@@ -187,12 +209,15 @@ fun MainScreen(
         // Link Tab 不吃 Scaffold 的顶部 padding，由 LinkScreen 自己 statusBarsPadding，
         // 让主页内容紧贴状态栏下方、WebView 页全屏沉浸
         Box(modifier = Modifier.fillMaxSize()) {
-            TabLayer(visible = selectedTab == 0, index = 0, modifier = Modifier.padding(padding)) {
+            // padding 已把内容垫到标题栏下方；consumeWindowInsets 让内层各页自己的
+            // Scaffold 不再把状态栏 inset 重复算一遍（否则标题栏下会多出一条 ~38dp 空带）。
+            // Link Tab 不吃 padding、靠自己 statusBarsPadding，故不做消费（见下方 index=3）。
+            TabLayer(visible = selectedTab == 0, index = 0, modifier = Modifier.padding(padding).consumeWindowInsets(padding)) {
                 FileListScreen(
                     configStore = configStore
                 )
             }
-            TabLayer(visible = selectedTab == 1, index = 1, modifier = Modifier.padding(padding)) {
+            TabLayer(visible = selectedTab == 1, index = 1, modifier = Modifier.padding(padding).consumeWindowInsets(padding)) {
                 ServiceListScreen(
                     configStore = configStore,
                     onEditShare = onEditShare,
@@ -207,7 +232,7 @@ fun MainScreen(
                     onEditRemote = onEditRemote
                 )
             }
-            TabLayer(visible = selectedTab == 2, index = 2, modifier = Modifier.padding(padding)) {
+            TabLayer(visible = selectedTab == 2, index = 2, modifier = Modifier.padding(padding).consumeWindowInsets(padding)) {
                 NetworkScreen()
             }
             TabLayer(visible = selectedTab == 3, index = 3) {
